@@ -198,10 +198,66 @@ def build_request(script: Script, model: str, lines: list[Line] | None = None) -
     }
 
 
+# Models served through the older generate_content TTS path rather than the Interactions
+# API. gemini-2.5-flash-preview-tts is listed on the models page but not on the
+# speech-generation (Interactions) page. Shape checked against google-genai 3.6.1 types
+# (GenerateContentConfig.speech_config), not against the live API.
+LEGACY_MODELS = frozenset({"gemini-2.5-flash-preview-tts"})
+
+
+def uses_legacy_api(model: str) -> bool:
+    return model in LEGACY_MODELS
+
+
+def build_legacy_request(script: Script, model: str, lines: list[Line] | None = None) -> dict[str, Any]:
+    """generate_content TTS request: a plain-text transcript plus speech_config.
+
+    There are no per-line annotations on this path, so styles go into a short
+    direction block before the transcript, and lines are separated by blank lines
+    with an instruction to pause between them. Dialogue lines are prefixed with
+    the speaker label that matches multi_speaker_voice_config.
+    """
+    lines = script.lines if lines is None else lines
+    used = []
+    for ln in lines:
+        if ln.speaker not in used:
+            used.append(ln.speaker)
+    multi = script.mode == "dialogue" and len(used) > 1
+    directions = []
+    transcript = []
+    for i, ln in enumerate(lines, 1):
+        who = f"{script.label(ln.speaker)}: " if multi else ""
+        directions.append(f"Line {i}: {ln.style}.")
+        transcript.append(f"{who}{ln.text}")
+    if len(lines) == 1:
+        head = f"Say this in a {lines[0].style} delivery:"
+    else:
+        names = " and ".join(script.label(s) for s in used)
+        kind = f"the following conversation between {names}" if multi else "the following lines"
+        head = (f"Read {kind} aloud. Leave a long pause of about one second between lines. "
+                "Speak only the transcript, not these directions.\n" + "\n".join(directions) + "\n\nTranscript:")
+    contents = head + "\n\n" + "\n\n".join(transcript)
+    if multi:
+        speech_config: dict[str, Any] = {"multi_speaker_voice_config": {"speaker_voice_configs": [
+            {"speaker": script.label(s["id"]), "voice_config": {"prebuilt_voice_config": {"voice_name": s["voice"]}}}
+            for s in script.speakers if s["id"] in used]}}
+    else:
+        voice = script.voice(used[0] if used else script.speakers[0]["id"])
+        speech_config = {"voice_config": {"prebuilt_voice_config": {"voice_name": voice}}}
+    return {"model": model, "contents": contents,
+            "config": {"response_modalities": ["AUDIO"], "speech_config": speech_config}}
+
+
+def build_tts_request(script: Script, model: str, lines: list[Line] | None = None) -> dict[str, Any]:
+    """Pick the request shape for the model's API path."""
+    return (build_legacy_request if uses_legacy_api(model) else build_request)(script, model, lines)
+
+
 # ------------------------------------------------------------------ TTS client
 
 class TTSClient(Protocol):
-    def create(self, **request: Any) -> Any: ...
+    def create(self, **request: Any) -> Any: ...  # Interactions API
+    def generate_content(self, **request: Any) -> Any: ...  # legacy TTS path
 
 
 class GeminiTTSClient:
@@ -220,6 +276,15 @@ class GeminiTTSClient:
     def create(self, **request: Any) -> Any:
         return self._client.interactions.create(**request)
 
+    def generate_content(self, **request: Any) -> Any:
+        return self._client.models.generate_content(**request)
+
+
+def call_tts(client: TTSClient, request: dict[str, Any]) -> Any:
+    if "contents" in request:
+        return client.generate_content(**request)
+    return client.create(**request)
+
 
 def is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, RetryableTTSError):
@@ -236,12 +301,49 @@ def _get(obj: Any, name: str) -> Any:
     return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
 
 
-def extract_audio(response: Any) -> bytes:
+def _legacy_inline_audio(response: Any) -> tuple[Any, str]:
+    for cand in _get(response, "candidates") or []:
+        content = _get(cand, "content")
+        for part in (_get(content, "parts") or []) if content is not None else []:
+            inline = _get(part, "inline_data")
+            if inline is not None and _get(inline, "data"):
+                return _get(inline, "data"), str(_get(inline, "mime_type") or "")
+    return None, ""
+
+
+def _rate_from_mime(mime: str) -> int | None:
+    for piece in mime.replace(";", " ").split():
+        if piece.lower().startswith("rate="):
+            try:
+                return int(piece.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def extract_audio_and_rate(response: Any) -> tuple[bytes, int | None]:
+    """Audio bytes from an Interactions response (output_audio) or a generate_content
+    response (candidates[].content.parts[].inline_data), plus a sample rate if declared."""
     audio = _get(response, "output_audio")
     data = _get(audio, "data") if audio is not None else None
+    rate = _rate_from_mime(str(_get(audio, "mime_type") or "")) if audio is not None else None
     if not data:
-        raise RetryableTTSError("TTS response has no output_audio data")
-    return base64.b64decode(data) if isinstance(data, str) else bytes(data)
+        data, mime = _legacy_inline_audio(response)
+        rate = _rate_from_mime(mime)
+    if not data:
+        raise RetryableTTSError("TTS response has no audio data")
+    blob = base64.b64decode(data) if isinstance(data, str) else bytes(data)
+    return blob, rate
+
+
+def extract_audio(response: Any) -> bytes:
+    return extract_audio_and_rate(response)[0]
+
+
+def decode_response(response: Any) -> tuple[bytes, np.ndarray, int]:
+    blob, rate = extract_audio_and_rate(response)
+    samples, got = decode_audio(blob, rate or TTS_RATE)
+    return blob, samples, got
 
 
 def _strip_audio(value: Any) -> Any:
@@ -484,12 +586,11 @@ class VoiceResult:
 
 def _voice_on_model(client: TTSClient, script: Script, model: str, out: Path, max_line_calls: int,
                     log: Callable[[str], None]) -> tuple[list[np.ndarray], int, int]:
-    request = build_request(script, model)
+    request = build_tts_request(script, model)
     (out / "tts-request.json").write_text(json.dumps(request, indent=2))
-    response = client.create(**request)
+    response = call_tts(client, request)
     (out / "tts-response.json").write_text(json.dumps({"model": model, "response": response_metadata(response)}, indent=2))
-    blob = extract_audio(response)
-    samples, rate = decode_audio(blob)
+    blob, samples, rate = decode_response(response)
     if blob[:4] == b"RIFF":
         (out / "tts-full.wav").write_bytes(blob)
     else:
@@ -506,10 +607,9 @@ def _voice_on_model(client: TTSClient, script: Script, model: str, out: Path, ma
     log(f"Could not split the take into {n} lines (found {found} pauses); voicing each line separately ({n} calls).")
     pieces, line_requests, line_rate = [], [], rate
     for ln in script.lines:
-        req = build_request(script, model, [ln])
+        req = build_tts_request(script, model, [ln])
         line_requests.append(req)
-        resp = client.create(**req)
-        s, r = decode_audio(extract_audio(resp))
+        _, s, r = decode_response(call_tts(client, req))
         if r != line_rate:
             raise VoiceError("per-line TTS responses returned different sample rates")
         piece = trim_silence(s, r)

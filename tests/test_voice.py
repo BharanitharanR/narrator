@@ -4,6 +4,7 @@ import io
 import json
 import shutil
 import wave
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -72,6 +73,20 @@ class FakeTTS:
         audio = take(texts, gap=gap)
         blob = (audio.clip(-1, 1) * 32767).astype("<i2").tobytes() if self.raw_pcm else wav_bytes(audio)
         return {"id": "fake", "model": model, "output_audio": {"mime_type": "audio/wav", "data": base64.b64encode(blob).decode()}}
+
+    def generate_content(self, **request):
+        """Legacy generate_content TTS path: raw PCM bytes in candidates[0].content.parts[0].inline_data."""
+        self.calls.append(request)
+        model = request["model"]
+        if model in self.fail:
+            raise self.fail[model]
+        body = request["contents"]
+        marker = "\n\nTranscript:\n\n"
+        texts = body.split(marker, 1)[1].split("\n\n") if marker in body else body.split("\n\n")[1:]
+        gap = 0.1 if self.merge_full and len(texts) > 1 else 0.9
+        pcm = (take(texts, gap=gap).clip(-1, 1) * 32767).astype("<i2").tobytes()
+        part = SimpleNamespace(inline_data=SimpleNamespace(data=pcm, mime_type="audio/L16;codec=pcm;rate=24000"))
+        return SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=[part]))])
 
 
 class ApiError(Exception):
@@ -337,3 +352,73 @@ def test_cli_registers_voice(tmp_path, monkeypatch, capsys):
         cli.main()
     assert exc.value.code == 0
     assert "Narration not requested" in capsys.readouterr().out
+
+
+# ------------------------------------------------- legacy generate_content path
+
+LEGACY = "gemini-2.5-flash-preview-tts"
+
+
+def test_legacy_routing():
+    script = v.read_script(single_plan())
+    assert v.uses_legacy_api(LEGACY) and not v.uses_legacy_api("gemini-3.8-flash-tts")
+    assert "contents" in v.build_tts_request(script, LEGACY)
+    assert "input" in v.build_tts_request(script, "gemini-3.8-flash-tts")
+
+
+def test_legacy_single_request_shape():
+    script = v.read_script(single_plan())
+    req = v.build_legacy_request(script, LEGACY)
+    assert req["model"] == LEGACY
+    assert req["config"] == {"response_modalities": ["AUDIO"],
+                             "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}}}
+    body = req["contents"]
+    assert "Line 1: friendly, normal pace, introducing the topic." in body
+    assert body.endswith("Open the customer lookup app.\n\nSearch for the order number to see its status.")
+    assert "<long pause>" not in body
+
+
+def test_legacy_dialogue_request_shape():
+    script = v.read_script(dialogue_plan())
+    req = v.build_legacy_request(script, LEGACY)
+    cfgs = req["config"]["speech_config"]["multi_speaker_voice_config"]["speaker_voice_configs"]
+    assert cfgs == [{"speaker": "Maya", "voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}},
+                    {"speaker": "Ravi", "voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}}]
+    assert "conversation between Maya and Ravi" in req["contents"]
+    assert "Maya: What are we looking at here?\n\nRavi: The order lookup screen." in req["contents"]
+    one = v.build_legacy_request(script, LEGACY, [script.lines[1]])
+    assert one["config"]["speech_config"] == {"voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}}
+    assert one["contents"].endswith("The order lookup screen.")
+
+
+def test_legacy_config_validates_against_sdk_types():
+    types = pytest.importorskip("google.genai.types")
+    for plan in (single_plan(), dialogue_plan()):
+        req = v.build_legacy_request(v.read_script(plan), LEGACY)
+        types.GenerateContentConfig.model_validate(req["config"])
+
+
+def test_legacy_audio_extraction():
+    pcm = (np.ones(160) * 0.5 * 32767).astype("<i2").tobytes()
+    resp = {"candidates": [{"content": {"parts": [{"text": "x"}, {"inline_data": {"data": base64.b64encode(pcm).decode(), "mime_type": "audio/L16;codec=pcm;rate=16000"}}]}}]}
+    blob, samples, rate = v.decode_response(resp)
+    assert blob == pcm and rate == 16000 and samples.size == 160
+
+
+def test_fallback_to_legacy_model_revoices_whole_script(tmp_path):
+    client = FakeTTS(fail={"gemini-3.8-flash-tts": ApiError(429, "RESOURCE_EXHAUSTED")})
+    logs = []
+    res = v.run_voice(dialogue_plan(), tmp_path, client=client, processor=identity, log=logs.append,
+                      models=["gemini-3.8-flash-tts", LEGACY])
+    assert res.model_used == LEGACY and res.fallback_used
+    assert "input" in client.calls[0] and "contents" in client.calls[1] and len(client.calls) == 2
+    tl = json.loads((tmp_path / "voiceover-timeline.json").read_text())
+    assert tl["model_used"] == LEGACY and len(tl["lines"]) == 3
+    assert json.loads((tmp_path / "tts-request.json").read_text())["model"] == LEGACY
+    assert "Gemini TTS model used: " + LEGACY in logs
+
+
+def test_legacy_per_line_fallback(tmp_path):
+    client = FakeTTS(merge_full=True)
+    res = v.run_voice(dialogue_plan(), tmp_path, client=client, models=[LEGACY], processor=identity, log=lambda m: None)
+    assert res.line_calls == 3 and all("contents" in c for c in client.calls)
