@@ -4,6 +4,7 @@ import io
 import json
 import shutil
 import wave
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -341,17 +342,66 @@ def test_end_to_end_with_ffmpeg(tmp_path):
         assert wf.getnframes() == 20 * 48000
 
 
-def test_cli_registers_voice(tmp_path, monkeypatch, capsys):
-    import sys
-
+def test_cli_registers_voice(tmp_path, capsys):
     from narrator import cli
     plan = tmp_path / "plan.json"
     plan.write_text(json.dumps(single_plan(decision={"narrate": False, "reason": "not useful"})))
-    monkeypatch.setattr(sys, "argv", ["narrator", "voice", str(plan), "-o", str(tmp_path / "out")])
-    with pytest.raises(SystemExit) as exc:
-        cli.main()
-    assert exc.value.code == 0
+    assert cli.main(["voice", str(plan), "-o", str(tmp_path / "out")]) == 0
     assert "Narration not requested" in capsys.readouterr().out
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_voice_with_fake_client(tmp_path):
+    import argparse
+
+    from narrator import cli
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps(single_plan()))
+    args = argparse.Namespace(plan=str(plan), output_dir=str(tmp_path / "out"), max_line_calls=12)
+    assert cli.cmd_voice(args, client=FakeTTS()) == 0
+    assert (tmp_path / "out" / "voiceover-timeline.json").exists()
+
+
+# ------------------------------------------------------ core example plans
+
+EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+
+
+@pytest.mark.parametrize("name", ["narration-plan.json", "narration-plan.dialogue.json"])
+def test_core_examples_voice(tmp_path, name):
+    from narrator.models import NarrationPlan
+    raw = json.loads((EXAMPLES / name).read_text())
+    model = NarrationPlan.model_validate(raw)
+    client = FakeTTS()
+    res = v.run_voice(EXAMPLES / name, tmp_path, client=client, models=["m"], processor=identity, log=lambda m: None)
+    assert res.written
+    tl = json.loads((tmp_path / "voiceover-timeline.json").read_text())
+    expected = []
+    for si, seg in enumerate(model.segments):
+        if seg.turns:
+            expected += [(si, ti, t.speaker, t.text) for ti, t in enumerate(seg.turns)]
+        elif seg.narration:
+            expected.append((si, None, (model.speakers[0].id if model.speakers else "narrator"), seg.narration.text))
+    assert [(ln["segment_index"], ln["turn_index"], ln["speaker"], ln["text"]) for ln in tl["lines"]] == expected
+    assert tl["duration_seconds"] == model.duration_seconds
+    for ln in tl["lines"]:
+        seg = model.segments[ln["segment_index"]]
+        assert ln["start_seconds"] >= seg.start_seconds
+    req = client.calls[0]
+    if model.mode == "dialogue":
+        assert req["generation_config"]["speech_config"] == {"speakers": [
+            {"speaker": s.name, "voice": s.voice} for s in model.speakers]}
+    else:
+        assert req["generation_config"]["speech_config"] == [{"voice": "Kore"}]
+    with wave.open(str(tmp_path / "voiceover.wav")) as wf:
+        assert wf.getnframes() == round(model.duration_seconds * 48000)
+
+
+def test_core_model_dump_round_trip(tmp_path):
+    from narrator.models import NarrationPlan
+    model = NarrationPlan.model_validate(json.loads((EXAMPLES / "narration-plan.dialogue.json").read_text()))
+    script = v.read_script(model.model_dump(mode="json"))
+    assert script.mode == "dialogue" and [s["voice"] for s in script.speakers] == [s.voice for s in model.speakers]
 
 
 # ------------------------------------------------- legacy generate_content path

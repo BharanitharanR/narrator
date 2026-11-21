@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.1",
+  "video_type": "demo",
+  "classification_confidence": 0.94,
+  "title": "Customer Order Lookup",
+  "recommendation": "recommended",
+  "mode": "dialogue",
+  "speakers": [
+    {"id": "host", "name": "Host", "role": "curious host", "voice": "Puck"},
+    {"id": "guide", "name": "Guide", "role": "guide who explains what is on screen", "voice": "Kore"}
+  ],
+  "decision": {"narrate": true, "reason": "video type demo (confidence 0.94) benefits from narration"},
+  "language": "en",
+  "audience": "new customer-support team members",
+  "overall_tone": "friendly",
+  "target_words_per_minute": 145,
+  "duration_seconds": 45,
+  "segments": [
+    {
+      "start_seconds": 0,
+      "end_seconds": 10,
+      "visual_action": "Customer lookup application opens",
+      "turns": [
+        {"speaker": "host", "text": "So where does an order lookup start?", "style": "curious", "tone": "friendly", "pace": "normal"},
+        {"speaker": "guide", "text": "In the customer lookup application, which opens on a single search field.", "style": "warm, explaining", "tone": "friendly", "pace": "normal"}
+      ],
+      "evidence": [{"source": "semantic_timeline", "timestamp_seconds": 1, "detail": "Customer lookup interface is visible."}],
+      "confidence": 0.9,
+      "estimated_speech_seconds": 8.16,
+      "fit_status": "fits"
+    }
+  ],
+  "no_voice_windows": [
+    {"start_seconds": 14, "end_seconds": 18, "reason": "important_visual", "detail": "Allow time to inspect the visible customer details."},
+    {"start_seconds": 30, "end_seconds": 34, "reason": "original_speech", "detail": "original speech detected in the source audio"}
+  ],
+  "review_notes": ["Illustrative example; use observed UI labels from the actual clip."],
+  "source_analysis": "analysis.json"
+}

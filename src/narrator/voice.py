@@ -667,24 +667,3 @@ def run_voice(plan: dict[str, Any] | str | Path, out_dir: str | Path = ".", *, c
             log(f"Overflow: segment {p.line.segment_index} line runs to {p.end:.2f}s and overlaps the next line or the video end.")
         return VoiceResult(True, f"Voiceover written to {out / 'voiceover.wav'}", model, fallback_used, line_calls, overflow)
     raise VoiceError("all Gemini TTS models failed: " + "; ".join(f"{a['model']}: {a['error']}" for a in attempts))
-
-
-# ---------------------------------------------------------------------- CLI hook
-
-def add_voice_command(subparsers: Any) -> None:
-    """Register `narrator voice` on an argparse subparsers object."""
-    p = subparsers.add_parser("voice", help="Voice a narration plan with Gemini TTS")
-    p.add_argument("plan", help="narration-plan.json")
-    p.add_argument("-o", "--output-dir", default=".", help="directory for voiceover.wav and voiceover-timeline.json")
-    p.add_argument("--max-line-calls", type=int, default=DEFAULT_MAX_LINE_CALLS,
-                   help="cap on per-line TTS calls if the single take cannot be split")
-    p.set_defaults(func=_voice_main)
-
-
-def _voice_main(args: Any) -> int:
-    try:
-        run_voice(args.plan, args.output_dir, max_line_calls=args.max_line_calls)
-    except VoiceError as exc:
-        print(f"narrator voice: {exc}")
-        return 1
-    return 0
