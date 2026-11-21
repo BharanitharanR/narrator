@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable, Iterable, TypeVar
+from collections.abc import Callable, Iterable
+from typing import TypeVar
 
 T = TypeVar("T")
 
@@ -79,7 +80,7 @@ def run_with_model_fallback(
     for index, model in enumerate(models):
         try:
             result = attempt(model)
-        except Exception as exc:  # noqa: BLE001 - classified below
+        except Exception as exc:
             if not is_retryable_model_error(exc):
                 raise
             summary = " ".join(str(exc).split())[:240]

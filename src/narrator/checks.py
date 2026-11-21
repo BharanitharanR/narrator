@@ -120,11 +120,11 @@ def speech_windows(segments: list[dict[str, float]], duration: float) -> tuple[l
     notes: list[str] = []
     for s in sorted(segments, key=lambda x: x["start_seconds"]):
         start, end = max(0.0, s["start_seconds"]), s["end_seconds"]
+        if start >= duration or end <= start:
+            notes.append(f"speech segment {s['start_seconds']:.2f}-{s['end_seconds']:.2f}s is empty or outside the video; ignored")
+            continue
         if end > duration:
             notes.append(f"speech segment {start:.2f}-{end:.2f}s ends after the video ({duration:.2f}s); window cut at the video end")
             end = duration
-        if end - start <= 0:
-            notes.append(f"speech segment {s['start_seconds']:.2f}-{s['end_seconds']:.2f}s is empty or outside the video; ignored")
-            continue
         windows.append({"start_seconds": round(start, 3), "end_seconds": round(end, 3), "reason": "original_speech", "detail": "original speech detected in the source audio"})
     return windows, notes

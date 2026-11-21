@@ -1,10 +1,16 @@
 import json
+from pathlib import Path
 
 import pytest
-
 from conftest import analysis_dict
+
 from narrator.models import NarrationPlan
-from narrator.planner import build_planning_context, classification_from_analysis, plan_with_provider, write_plan
+from narrator.planner import (
+    build_planning_context,
+    classification_from_analysis,
+    plan_with_provider,
+    write_plan,
+)
 from narrator.prompt import build_user_prompt
 
 
@@ -91,5 +97,5 @@ def test_raw_saved_even_when_validation_fails(write_analysis, fake_provider, tmp
 
 
 def test_v10_example_still_validates():
-    data = json.load(open("examples/narration-plan.json"))
+    data = json.loads(Path(__file__).resolve().parents[1].joinpath("examples/narration-plan.json").read_text())
     assert NarrationPlan.model_validate(data).schema_version == "1.0"
